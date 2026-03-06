@@ -1,0 +1,213 @@
+# pip install pandas nltk pyodbc sqlalchemy
+
+import pandas as pd
+import pyodbc
+import nltk
+import logging
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from sqlalchemy import create_engine
+
+
+# -----------------------------
+# Logging setup
+# -----------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+
+# -----------------------------
+# Download VADER lexicon
+# -----------------------------
+
+nltk.download("vader_lexicon")
+
+
+# -----------------------------
+# Database configuration
+# -----------------------------
+
+SERVER = "localhost\\SQLEXPRESS"
+DATABASE = "PortfolioProject_MarketingAnalytics"
+
+ODBC_CONN_STR = (
+    "Driver={SQL Server};"
+    f"Server={SERVER};"
+    f"Database={DATABASE};"
+    "Trusted_Connection=yes;"
+)
+
+SQLALCHEMY_CONN_STR = (
+    f"mssql+pyodbc://@{SERVER}/{DATABASE}"
+    "?driver=SQL+Server&trusted_connection=yes"
+)
+
+engine = create_engine(SQLALCHEMY_CONN_STR)
+
+
+# -----------------------------
+# Fetch data from SQL Server
+# -----------------------------
+
+def fetch_data(query: str) -> pd.DataFrame:
+    """Fetch data from SQL Server into a pandas DataFrame"""
+
+    try:
+        with pyodbc.connect(ODBC_CONN_STR) as conn:
+            df = pd.read_sql(query, conn)
+
+        logging.info("Data successfully retrieved from SQL Server")
+        return df
+
+    except Exception as e:
+        logging.error(f"Database connection failed: {e}")
+        raise
+
+
+# -----------------------------
+# Sentiment analysis setup
+# -----------------------------
+
+sia = SentimentIntensityAnalyzer()
+
+
+def calculate_sentiment(text: str) -> float:
+    """Return VADER compound sentiment score"""
+
+    if pd.isna(text):
+        return 0
+
+    return sia.polarity_scores(text)["compound"]
+
+
+def categorize_sentiment(score: float, rating: int) -> str:
+    """Categorise sentiment using score and rating"""
+
+    if score > 0.05:
+
+        if rating >= 4:
+            return "Positive"
+
+        elif rating == 3:
+            return "Mixed Positive"
+
+        else:
+            return "Mixed Negative"
+
+    elif score < -0.05:
+
+        if rating <= 2:
+            return "Negative"
+
+        elif rating == 3:
+            return "Mixed Negative"
+
+        else:
+            return "Mixed Positive"
+
+    else:
+
+        if rating >= 4:
+            return "Positive"
+
+        elif rating <= 2:
+            return "Negative"
+
+        else:
+            return "Neutral"
+
+
+def sentiment_bucket(score: float) -> str:
+    """Bucket sentiment score into defined ranges"""
+
+    if score >= 0.5:
+        return "0.5 to 1.0"
+
+    elif score >= 0:
+        return "0.0 to 0.49"
+
+    elif score >= -0.5:
+        return "-0.49 to 0.0"
+
+    else:
+        return "-1.0 to -0.5"
+
+
+# -----------------------------
+# Main pipeline
+# -----------------------------
+
+def main():
+
+    query = """
+        SELECT
+            ReviewID,
+            CustomerID,
+            ProductID,
+            ReviewDate,
+            Rating,
+            ReviewText
+        FROM fact_customer_reviews
+    """
+
+    logging.info("Starting data pipeline")
+
+    # Extract
+    df = fetch_data(query)
+
+    logging.info("Running sentiment analysis")
+
+    # Sentiment score (faster list comprehension)
+    df["SentimentScore"] = [
+        sia.polarity_scores(text)["compound"] if pd.notna(text) else 0
+        for text in df["ReviewText"]
+    ]
+
+    # Sentiment category
+    df["SentimentCategory"] = df.apply(
+        lambda r: categorize_sentiment(r["SentimentScore"], r["Rating"]),
+        axis=1
+    )
+
+    # Sentiment bucket
+    df["SentimentBucket"] = df["SentimentScore"].apply(sentiment_bucket)
+
+    logging.info("Writing enriched review data to SQL Server")
+
+    df.to_sql(
+        "fact_customer_reviews_sentiment",
+        engine,
+        if_exists="replace",
+        index=False
+    )
+
+    # -----------------------------
+    # Create summary table
+    # -----------------------------
+
+    logging.info("Creating sentiment summary table")
+
+    summary = (
+        df.groupby("SentimentCategory")
+        .size()
+        .reset_index(name="ReviewCount")
+    )
+
+    summary.to_sql(
+        "sentiment_summary",
+        engine,
+        if_exists="replace",
+        index=False
+    )
+
+    logging.info("Pipeline completed successfully")
+
+
+# -----------------------------
+# Entry point
+# -----------------------------
+
+if __name__ == "__main__":
+    main()
